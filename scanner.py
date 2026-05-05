@@ -1,7 +1,9 @@
+
 import requests
 import pandas as pd
 import csv
 import os
+import time
 
 # ===== 填你的TG信息 =====
 TOKEN = "8622148245:AAGkE67IDi9FlwdvytFAjd5EHecADP1S5eQ"
@@ -9,30 +11,59 @@ CHAT_ID = "8271499388"
 
 # ===== TG发送 =====
 def send(msg):
-    url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
-    requests.post(url, data={"chat_id": CHAT_ID, "text": msg})
+    try:
+        url = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
+        requests.post(url, data={"chat_id": CHAT_ID, "text": msg}, timeout=10)
+    except:
+        pass
 
-# ===== 获取市场数据 =====
+# ===== 获取市场数据（已加保护）=====
 def get_symbols():
     url = "https://api.binance.com/api/v3/ticker/24hr"
-    data = requests.get(url).json()
-    df = pd.DataFrame(data)
 
-    df["priceChangePercent"] = df["priceChangePercent"].astype(float)
-    df["quoteVolume"] = df["quoteVolume"].astype(float)
+    try:
+        res = requests.get(url, timeout=10)
+        data = res.json()
 
-    df = df[df["symbol"].str.endswith("USDT")]
-    df = df[df["quoteVolume"] > 5_000_000]
+        if not isinstance(data, list):
+            send("⚠️ Binance API异常")
+            return pd.DataFrame()
 
-    return df
+        df = pd.DataFrame(data)
 
-# ===== 获取K线 =====
+        df["priceChangePercent"] = pd.to_numeric(df["priceChangePercent"], errors="coerce")
+        df["quoteVolume"] = pd.to_numeric(df["quoteVolume"], errors="coerce")
+
+        df = df[df["symbol"].str.endswith("USDT")]
+        df = df[df["quoteVolume"] > 5_000_000]
+
+        return df.dropna()
+
+    except Exception as e:
+        send(f"⚠️ 获取行情失败: {e}")
+        return pd.DataFrame()
+
+# ===== 获取K线（加重试+限速）=====
 def get_klines(symbol, interval):
     url = f"https://api.binance.com/api/v3/klines?symbol={symbol}&interval={interval}&limit=100"
-    data = requests.get(url).json()
-    df = pd.DataFrame(data)
-    df[4] = df[4].astype(float)
-    return df[4]
+
+    for _ in range(3):  # 重试3次
+        try:
+            res = requests.get(url, timeout=10)
+            data = res.json()
+
+            if not isinstance(data, list):
+                time.sleep(1)
+                continue
+
+            df = pd.DataFrame(data)
+            df[4] = pd.to_numeric(df[4], errors="coerce")
+            return df[4].dropna()
+
+        except:
+            time.sleep(1)
+
+    return pd.Series()
 
 # ===== RSI =====
 def rsi(series, period=14):
@@ -68,10 +99,11 @@ def check_results():
         entry = row["entry"]
         direction = row["direction"]
 
-        try:
-            price = get_klines(symbol, "5m").iloc[-1]
-        except:
+        prices = get_klines(symbol, "5m")
+        if prices.empty:
             continue
+
+        price = prices.iloc[-1]
 
         if direction == "long":
             if price >= entry * 1.04:
@@ -114,21 +146,26 @@ def stats():
 # ===== 分析逻辑 =====
 def analyze(symbol):
     def calc(p):
+        if p.empty or len(p) < 20:
+            return None, None, None
         ma5 = p.rolling(5).mean()
         ma20 = p.rolling(20).mean()
         r = rsi(p)
         return ma5, ma20, r
 
-    try:
-        p5 = get_klines(symbol, "5m")
-        p15 = get_klines(symbol, "15m")
-        p1h = get_klines(symbol, "1h")
-    except:
+    p5 = get_klines(symbol, "5m")
+    p15 = get_klines(symbol, "15m")
+    p1h = get_klines(symbol, "1h")
+
+    if p5.empty or p15.empty or p1h.empty:
         return None
 
     ma5_5, ma20_5, r5 = calc(p5)
     ma5_15, ma20_15, _ = calc(p15)
     ma5_1h, ma20_1h, _ = calc(p1h)
+
+    if ma20_5 is None:
+        return None
 
     last = p5.iloc[-1]
 
@@ -136,21 +173,15 @@ def analyze(symbol):
     score_short = 0
 
     # 趋势
-    if ma5_15.iloc[-1] > ma20_15.iloc[-1]:
-        score_long += 1
-    if ma5_1h.iloc[-1] > ma20_1h.iloc[-1]:
-        score_long += 1
+    if ma5_15.iloc[-1] > ma20_15.iloc[-1]: score_long += 1
+    if ma5_1h.iloc[-1] > ma20_1h.iloc[-1]: score_long += 1
 
-    if ma5_15.iloc[-1] < ma20_15.iloc[-1]:
-        score_short += 1
-    if ma5_1h.iloc[-1] < ma20_1h.iloc[-1]:
-        score_short += 1
+    if ma5_15.iloc[-1] < ma20_15.iloc[-1]: score_short += 1
+    if ma5_1h.iloc[-1] < ma20_1h.iloc[-1]: score_short += 1
 
     # RSI
-    if r5.iloc[-1] > 45:
-        score_long += 1
-    if r5.iloc[-1] < 55:
-        score_short += 1
+    if r5.iloc[-1] > 45: score_long += 1
+    if r5.iloc[-1] < 55: score_short += 1
 
     # 回踩
     if abs(last - ma20_5.iloc[-1]) / last < 0.01:
@@ -160,46 +191,26 @@ def analyze(symbol):
     entry_low = round(ma20_5.iloc[-1] * 0.995, 2)
     entry_high = round(ma20_5.iloc[-1] * 1.005, 2)
 
-    # ===== 做多 =====
+    # 做多
     if score_long >= 4:
         save_signal(symbol, "long", last)
+        return f"""【{symbol} 做多｜{score_long}/5】
 
-        return f"""【{symbol} 做多｜强度：{score_long}/5】
-
-当前价：{round(last,2)}
-
-📊 趋势：
-1h / 15m 多头
-
-📍 入场逻辑：
-回踩MA20 + RSI回升
-
-🎯 入场区间：
-{entry_low} - {entry_high}
-
-🛑 止损：-2%
-🎯 止盈：+4%
+价格：{round(last,2)}
+入场：{entry_low}-{entry_high}
+止损：-2%
+止盈：+4%
 """
 
-    # ===== 做空 =====
+    # 做空
     if score_short >= 4:
         save_signal(symbol, "short", last)
+        return f"""【{symbol} 做空｜{score_short}/5】
 
-        return f"""【{symbol} 做空｜强度：{score_short}/5】
-
-当前价：{round(last,2)}
-
-📊 趋势：
-1h / 15m 空头
-
-📍 入场逻辑：
-反弹MA20 + RSI回落
-
-🎯 入场区间：
-{entry_high} - {entry_low}
-
-🛑 止损：+2%
-🎯 止盈：+4%
+价格：{round(last,2)}
+入场：{entry_high}-{entry_low}
+止损：+2%
+止盈：+4%
 """
 
     return None
@@ -209,6 +220,11 @@ def run():
     check_results()
 
     df = get_symbols()
+
+    if df.empty:
+        send("⚠️ 市场数据获取失败")
+        return
+
     top = df.sort_values("priceChangePercent", ascending=False).head(20)
 
     results = []
@@ -217,6 +233,7 @@ def run():
         msg = analyze(row["symbol"])
         if msg:
             results.append(msg)
+        time.sleep(0.3)  # 防止限流
 
     if results:
         send("\n\n".join(results))
