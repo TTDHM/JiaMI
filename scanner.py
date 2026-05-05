@@ -4,8 +4,7 @@ import csv
 import os
 
 # ===== 填你的TG信息 =====
-TOKEN = "8622148245:AAGkE67IDi9FlwdvytFAjd5EHecADP1S5eQ
-"
+TOKEN = "8622148245:AAGkE67IDi9FlwdvytFAjd5EHecADP1S5eQ"
 CHAT_ID = "8271499388"
 
 # ===== TG发送 =====
